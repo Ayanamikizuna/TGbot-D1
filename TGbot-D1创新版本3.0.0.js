@@ -57,6 +57,48 @@ const USER_UPDATE_FIELDS = new Set([
 ]);
 
 let migrationPromise = null;
+let botCommandsPromise = null;
+
+async function ensureBotCommands(env) {
+  if (botCommandsPromise) {
+    return botCommandsPromise;
+  }
+
+  botCommandsPromise = telegramApi(
+    env.BOT_TOKEN,
+    'setMyCommands',
+    {
+      commands: [
+        {
+          command: 'ban',
+          description: '封禁当前话题用户'
+        },
+        {
+          command: 'unban',
+          description: '解除当前话题用户封禁'
+        },
+        {
+          command: 'delete',
+          description: '删除被回复的消息'
+        },
+        {
+          command: 'terminate',
+          description: '删除当前用户话题'
+        }
+      ]
+    }
+  ).catch((error) => {
+    botCommandsPromise = null;
+
+    console.error(
+      '注册机器人命令失败：',
+      error?.message || error
+    );
+  });
+
+  return botCommandsPromise;
+}
+
 
 /* -------------------------------------------------------------------------- */
 /*                               通用辅助函数                                   */
@@ -1566,24 +1608,24 @@ async function ensureUserTopic(
     await dbUserGetOrCreate(userId, env);
 
   if (user.topic_id) {
-    if (!user.info_card_message_id) {
-      try {
-        await createInfoCard(
-          message,
-          user,
-          user.topic_id,
-          env
-        );
-      } catch (error) {
-        console.error(
-          '补建资料卡失败：',
-          error?.message || error
-        );
-      }
+  if (!user.info_card_message_id) {
+    try {
+      await createInfoCard(
+        message,
+        user,
+        user.topic_id,
+        env
+      );
+    } catch (error) {
+      console.error(
+        '补建资料卡失败：',
+        error?.message || error
+      );
     }
-
-    return user.topic_id;
   }
+
+  return user.topic_id;
+}
 
   const now = Math.floor(Date.now() / 1000);
   const staleTime =
@@ -3226,6 +3268,334 @@ async function handlePrivateMessage(
 /* -------------------------------------------------------------------------- */
 /*                              管理员回复处理                                   */
 /* -------------------------------------------------------------------------- */
+function parseAdminCommand(text) {
+  const value = String(text || '').trim();
+
+  const match = value.match(
+    /^\/([a-zA-Z_]+)(?:@\w+)?(?:\s+(.+))?$/
+  );
+
+  if (!match) {
+    return null;
+  }
+
+  return {
+    command: match[1].toLowerCase(),
+    argument: match[2]?.trim() || ''
+  };
+}
+
+async function resolveTopicUserId(
+  message,
+  env,
+  argument = ''
+) {
+  if (argument) {
+    const userId = argument
+      .split(/\s+/)[0]
+      .trim();
+
+    if (/^\d+$/.test(userId)) {
+      return userId;
+    }
+
+    return null;
+  }
+
+  if (!message?.message_thread_id) {
+    return null;
+  }
+
+  return dbTopicUserGet(
+    String(message.message_thread_id),
+    env
+  );
+}
+
+async function sendTopicNotice(
+  message,
+  text,
+  env
+) {
+  return telegramApi(
+    env.BOT_TOKEN,
+    'sendMessage',
+    {
+      chat_id: env.ADMIN_GROUP_ID,
+      message_thread_id:
+        Number(message.message_thread_id),
+      text
+    }
+  );
+}
+
+async function handleAdminCommand(
+  message,
+  env
+) {
+  const parsed =
+    parseAdminCommand(message.text);
+
+  if (!parsed) {
+    return false;
+  }
+
+  const allowedCommands = new Set([
+    'ban',
+    'unban',
+    'delete',
+    'terminate'
+  ]);
+
+  if (!allowedCommands.has(parsed.command)) {
+    return false;
+  }
+
+  const senderId =
+    String(message.from?.id || '');
+
+  const isAdmin =
+    await isAdminUser(senderId, env);
+
+  if (!isAdmin) {
+    return true;
+  }
+
+  const topicId = String(
+    message.message_thread_id || ''
+  );
+
+  if (!topicId) {
+    await telegramApi(
+      env.BOT_TOKEN,
+      'sendMessage',
+      {
+        chat_id: env.ADMIN_GROUP_ID,
+        text:
+          '⚠️ 这些命令只能在用户话题中使用。'
+      }
+    );
+
+    return true;
+  }
+
+  if (parsed.command === 'ban') {
+    const userId =
+      await resolveTopicUserId(
+        message,
+        env,
+        parsed.argument
+      );
+
+    if (!userId) {
+      await sendTopicNotice(
+        message,
+        '❌ 找不到该话题对应的用户 ID。\n' +
+        '也可以使用：/ban 用户ID',
+        env
+      );
+
+      return true;
+    }
+
+    const user =
+      await dbUserGetOrCreate(
+        userId,
+        env
+      );
+
+    await dbUserUpdate(
+      userId,
+      {
+        is_blocked: true
+      },
+      env
+    );
+
+    await sendTopicNotice(
+      message,
+      `🚫 已封禁用户 ${userId}。`,
+      env
+    );
+
+    if (!user.is_blocked) {
+      try {
+        await telegramApi(
+          env.BOT_TOKEN,
+          'sendMessage',
+          {
+            chat_id: userId,
+            text:
+              '⚠️ 您已被管理员封禁，' +
+              '无法继续发送消息。'
+          }
+        );
+      } catch (error) {
+        console.error(
+          '发送封禁通知失败：',
+          error?.message || error
+        );
+      }
+    }
+
+    return true;
+  }
+
+  if (parsed.command === 'unban') {
+    const userId =
+      await resolveTopicUserId(
+        message,
+        env,
+        parsed.argument
+      );
+
+    if (!userId) {
+      await sendTopicNotice(
+        message,
+        '❌ 找不到该话题对应的用户 ID。\n' +
+        '也可以使用：/unban 用户ID',
+        env
+      );
+
+      return true;
+    }
+
+    await dbUserUpdate(
+      userId,
+      {
+        is_blocked: false,
+        block_count: 0
+      },
+      env
+    );
+
+    await sendTopicNotice(
+      message,
+      `✅ 已解除用户 ${userId} 的封禁。`,
+      env
+    );
+
+    try {
+      await telegramApi(
+        env.BOT_TOKEN,
+        'sendMessage',
+        {
+          chat_id: userId,
+          text:
+            '✅ 管理员已解除对您的封禁，' +
+            '现在可以继续发送消息。'
+        }
+      );
+    } catch (error) {
+      console.error(
+        '发送解禁通知失败：',
+        error?.message || error
+      );
+    }
+
+    return true;
+  }
+
+  if (parsed.command === 'delete') {
+    const repliedMessage =
+      message.reply_to_message;
+
+    if (!repliedMessage?.message_id) {
+      await sendTopicNotice(
+        message,
+        '⚠️ 请先回复要删除的消息，再发送 /delete。',
+        env
+      );
+
+      return true;
+    }
+
+    try {
+      await telegramApi(
+        env.BOT_TOKEN,
+        'deleteMessage',
+        {
+          chat_id: env.ADMIN_GROUP_ID,
+          message_id:
+            repliedMessage.message_id
+        }
+      );
+
+      await telegramApi(
+        env.BOT_TOKEN,
+        'deleteMessage',
+        {
+          chat_id: env.ADMIN_GROUP_ID,
+          message_id:
+            message.message_id
+        }
+      );
+    } catch (error) {
+      await sendTopicNotice(
+        message,
+        `❌ 删除消息失败：` +
+        `${error?.message || error}`,
+        env
+      );
+    }
+
+    return true;
+  }
+
+  if (parsed.command === 'terminate') {
+    const userId =
+      await resolveTopicUserId(
+        message,
+        env,
+        parsed.argument
+      );
+
+    if (!userId) {
+      await sendTopicNotice(
+        message,
+        '❌ 找不到该话题对应的用户 ID。\n' +
+        '也可以使用：/terminate 用户ID',
+        env
+      );
+
+      return true;
+    }
+
+    try {
+      await telegramApi(
+        env.BOT_TOKEN,
+        'deleteForumTopic',
+        {
+          chat_id: env.ADMIN_GROUP_ID,
+          message_thread_id:
+            Number(topicId)
+        }
+      );
+
+      await dbUserUpdate(
+        userId,
+        {
+          topic_id: null,
+          info_card_message_id: null,
+          topic_creating: false,
+          topic_lock_at: null
+        },
+        env
+      );
+    } catch (error) {
+      await sendTopicNotice(
+        message,
+        `❌ 删除话题失败：` +
+        `${error?.message || error}`,
+        env
+      );
+    }
+
+    return true;
+  }
+
+  return false;
+}
 
 async function handleAdminReply(
   message,
@@ -3256,11 +3626,27 @@ async function handleAdminReply(
     await isAdminUser(senderId, env);
 
   if (!isAdmin) {
+  return;
+}
+
+if (
+  message.text &&
+  message.text.trim().startsWith('/')
+) {
+  const handled =
+    await handleAdminCommand(
+      message,
+      env
+    );
+
+  if (handled) {
     return;
   }
+}
 
-  const topicId =
-    String(message.message_thread_id);
+const topicId =
+  String(message.message_thread_id);
+
 
   const userId =
     await dbTopicUserGet(
@@ -4507,6 +4893,10 @@ export default {
     try {
       validateEnvironment(env);
       await ensureMigration(env);
+
+      ctx.waitUntil(
+        ensureBotCommands(env)
+      );
     } catch (error) {
       console.error(
         '初始化失败：',
@@ -4602,9 +4992,10 @@ export default {
       )
     );
 
-    // 随机执行清理，避免每次请求都清理数据库。
     if (Math.random() < 0.01) {
-      ctx.waitUntil(cleanupDatabase(env));
+      ctx.waitUntil(
+        cleanupDatabase(env)
+      );
     }
 
     return new Response('OK', {
@@ -4616,3 +5007,4 @@ export default {
     });
   }
 };
+
