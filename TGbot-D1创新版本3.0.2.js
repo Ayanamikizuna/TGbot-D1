@@ -4078,16 +4078,27 @@ async function handleRuleList(
       `第 ${pageInfo.page + 1}/` +
       `${pageInfo.totalPages} 页`;
 
-    rows = pageRules.map((rule, index) => [
-      {
-        text:
-          `删除 ${start + index + 1}. ` +
-          `${String(rule.keywords).slice(0, 25)}`,
-        callback_data:
-          `config:delete:keyword_responses:` +
-          `${rule.id}:${pageInfo.page}`
-      }
-    ]);
+    rows = pageRules.map((rule, index) => {
+  const absoluteIndex = start + index;
+
+  const keywordPreview = Array.from(
+    String(rule.keywords || '')
+  )
+    .slice(0, 25)
+    .join('');
+
+  return [
+    {
+      text:
+        `删除 ${absoluteIndex + 1}. ` +
+        `${keywordPreview}`,
+      callback_data:
+        `config:delete:keyword_responses:` +
+        `${absoluteIndex}:${pageInfo.page}`
+    }
+  ];
+});
+
 
     const navigation = [];
 
@@ -4216,28 +4227,34 @@ async function handleRuleDelete(
   env
 ) {
   if (type === 'keyword_responses') {
-    const rules =
-      await getAutoReplyRules(env);
+  const rules =
+    await getAutoReplyRules(env);
 
-    const next = rules.filter(
-      (rule) =>
-        String(rule.id) !== String(value)
-    );
+  const index = Number(value);
+
+  if (
+    Number.isInteger(index) &&
+    index >= 0 &&
+    index < rules.length
+  ) {
+    rules.splice(index, 1);
 
     await setConfig(
       'keyword_responses',
-      JSON.stringify(next),
-      env
-    );
-
-    return handleRuleList(
-      chatId,
-      messageId,
-      type,
-      page,
+      JSON.stringify(rules),
       env
     );
   }
+
+  return handleRuleList(
+    chatId,
+    messageId,
+    type,
+    page,
+    env
+  );
+}
+
 
   if (type === 'block_keywords') {
     const keywords =
